@@ -1,0 +1,109 @@
+sentence-transformers>=2.2.2
+torch>=2.0.0
+
+openai>=1.6.0
+streamlit>=1.32.0
+python-dotenv>=1.0.0
+sentence-transformers>=2.2.2
+torch>=2.0.0
+# ... (other existing packages you already have)
+
+===================================================
+# backend/llm_client.py
+from __future__ import annotations
+
+import os
+import json
+from typing import Any, Dict, List
+
+from openai import AzureOpenAI
+from sentence_transformers import SentenceTransformer
+
+# -----------------------------
+# Azure OpenAI (chat only)
+# -----------------------------
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+AZURE_DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT")
+
+azure_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+
+# -----------------------------
+# Local embeddings (open-source)
+# -----------------------------
+# This will be downloaded automatically the first time you run it
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+
+def embed_texts(texts: List[Any]) -> List[List[float]]:
+    """
+    Compute sentence embeddings locally using an open-source model.
+    This replaces Azure embeddings completely.
+
+    Input:  list of arbitrary text-like objects
+    Output: list of embedding vectors (lists of floats)
+    """
+    clean: List[str] = []
+
+    for t in texts:
+        if t is None:
+            continue
+
+        if isinstance(t, bytes):
+            s = t.decode("utf-8", errors="ignore")
+        else:
+            s = str(t)
+
+        s = s.replace("\x00", "")
+        if s.strip():
+            clean.append(s)
+
+    if not clean:
+        return []
+
+    # encode returns a numpy array; convert to nested Python lists
+    vecs = embedding_model.encode(
+        clean,
+        normalize_embeddings=True,       # cosine similarity-friendly
+        convert_to_numpy=True,
+    )
+
+    return vecs.tolist()
+
+
+def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 4000) -> Dict[str, Any]:
+    """
+    Call Azure OpenAI chat completion, expecting *JSON* output.
+    This part is unchanged – still uses your Azure chat deployment.
+    """
+    resp = azure_client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_CHAT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.1,
+    )
+    text = resp.choices[0].message.content
+
+    print("\n---- RAW LLM RESPONSE ----\n", text)
+
+    try:
+        return json.loads(text)
+    except Exception:
+        # try to salvage JSON substring if model adds extra text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(text[start : end + 1])
+        raise
+
+============================================================================
+
