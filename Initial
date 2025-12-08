@@ -107,3 +107,34 @@ def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 4000) -> 
 
 ============================================================================
 
+# backend/llm_client.py
+from __future__ import annotations
+from typing import List
+
+from sentence_transformers import SentenceTransformer
+
+# ---------------------------------------------------------
+# Load embedding model ONCE at import time
+# ---------------------------------------------------------
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+print(f"[Embedding] Loading local model: {EMBEDDING_MODEL_NAME} ...")
+
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+print("[Embedding] Model loaded successfully.")
+
+# ---------------------------------------------------------
+# Embedding wrapper function
+# ---------------------------------------------------------
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Takes a list of strings and returns a list of embedding vectors.
+    Uses local SentenceTransformer embeddings.
+    """
+    if not texts:
+        return []
+
+    # SentenceTransformer returns a numpy array — convert to Python lists
+    embeddings = embedding_model.encode(texts, convert_to_numpy=True).tolist()
+    return embeddings
