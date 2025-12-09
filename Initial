@@ -138,3 +138,144 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     # SentenceTransformer returns a numpy array — convert to Python lists
     embeddings = embedding_model.encode(texts, convert_to_numpy=True).tolist()
     return embeddings
+
+
+
+
+
+
+
+
+
+###############
+
+# backend/llm_client.py
+from __future__ import annotations
+
+import os
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+from openai import AzureOpenAI
+from sentence_transformers import SentenceTransformer
+
+
+# ---------------------------------------------------------
+# Azure OpenAI (CHAT ONLY)
+# ---------------------------------------------------------
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+AZURE_DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT")
+
+azure_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+
+
+# ---------------------------------------------------------
+# Local embeddings via SentenceTransformer
+# ---------------------------------------------------------
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+print(f"[Embedding] Loading local model: {EMBEDDING_MODEL_NAME} ...")
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+print("[Embedding] Model loaded successfully.")
+
+
+def embed_texts(texts: List[Any]) -> List[List[float]]:
+    """
+    Compute embeddings locally using an open-source model.
+    This completely replaces Azure embeddings.
+
+    Input:  list of arbitrary text-like objects
+    Output: list of embedding vectors (lists of floats)
+    """
+    clean: List[str] = []
+
+    for t in texts:
+        if t is None:
+            continue
+
+        if isinstance(t, bytes):
+            s = t.decode("utf-8", errors="ignore")
+        else:
+            s = str(t)
+
+        s = s.replace("\x00", "")
+        if s.strip():
+            clean.append(s)
+
+    if not clean:
+        return []
+
+    vecs = embedding_model.encode(
+        clean,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+
+    return vecs.tolist()
+
+
+# ---------------------------------------------------------
+# Chat → JSON with robust fallback
+# ---------------------------------------------------------
+def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 4000) -> Dict[str, Any]:
+    """
+    Call Azure chat model and try to parse the response as JSON.
+    If JSON is malformed, return a safe fallback structure instead
+    of crashing.
+    """
+    resp = azure_client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_CHAT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+        temperature=0.1,
+        max_tokens=max_tokens,
+    )
+
+    text = resp.choices[0].message.content
+
+    # Save raw response for debugging
+    try:
+        Path("backend/data").mkdir(parents=True, exist_ok=True)
+        with open("backend/data/last_llm_response.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+    # 1) Try direct JSON parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Try to salvage the substring between the first '{' and last '}'
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # 3) FINAL FALLBACK:
+    #    Return a safe dict that has the expected keys so the rest of the
+    #    pipeline can continue instead of crashing.
+    return {
+        "doc": {
+            "raw_text": text,
+            "note": "LLM did not return valid JSON; raw text captured instead.",
+        },
+        "validation": {
+            "status": "json_parse_failed",
+            "message": "Fallback used because JSON decoding failed.",
+        },
+    }
