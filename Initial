@@ -998,3 +998,117 @@ def convert_file_to_spring(
             continue
         result[name] = conv.generate_for_class(name)
     return result
+
+==========================================================
+
+
+# backend/pipeline.py
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, Any
+
+from .ast_extractor import run_java_extractor, load_ast
+from .doc_generator import generate_documentation_for_file
+from .test_generator import generate_tests_for_spring_class
+from .config import AST_JSON_PATH, DEFAULT_LEGACY_REPO
+from .json_store import load_state, save_state
+from .blueprint_converter import BlueprintSpringBootConverter
+
+
+def ensure_ast(repo: Path = DEFAULT_LEGACY_REPO) -> Dict[str, Any]:
+    """
+    Make sure backend/data/ast.json exists, otherwise run the Java extractor.
+    """
+    if not AST_JSON_PATH.exists():
+        return run_java_extractor(repo, AST_JSON_PATH)
+    return load_ast(AST_JSON_PATH)
+
+
+def generate_docs(file_name: str, repo: Path = DEFAULT_LEGACY_REPO) -> Dict[str, Any]:
+    """
+    Full pipeline for a given legacy .java file:
+    - ensure AST
+    - chunk + generate documentation per chunk
+    - collate into per-class documentation
+    - persist JSON under backend/docs/<file_stem>.json
+    - update status in json_store
+    """
+    ast = ensure_ast(repo)
+    file_path = repo / file_name
+    file_doc = generate_documentation_for_file(ast, file_path)
+
+    meta = load_state()
+    fmeta = meta.setdefault(file_name, {})
+    fmeta["doc_status"] = "generated"
+    save_state(meta)
+
+    return file_doc
+
+
+def convert_class_to_spring(
+    file_name: str,
+    class_name: str,
+    repo: Path = DEFAULT_LEGACY_REPO,
+):
+    """
+    Convert a single documented class to Spring Boot, using the
+    BlueprintSpringBootConverter.  This is what your Streamlit UI calls.
+    """
+    from .doc_generator import DOCS_DIR  # local import to avoid circulars
+
+    # Ensure AST exists (not strictly needed here but keeps the pipeline consistent)
+    ensure_ast(repo)
+
+    doc_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    if not doc_path.exists():
+        raise RuntimeError("Documentation not found; generate docs first.")
+
+    file_doc = json.loads(doc_path.read_text(encoding="utf-8"))
+
+    # Use the blueprint-aware converter instead of the older generate_spring_for_class
+    converter = BlueprintSpringBootConverter(file_doc, base_package="com.bank.cheque")
+    spring_path = converter.generate_for_class(class_name)
+
+    # Persist status so the UI table shows 'Generated'
+    meta = load_state()
+    fmeta = meta.setdefault(file_name, {})
+    classes_meta = fmeta.setdefault("classes", {})
+    cmeta = classes_meta.setdefault(class_name, {})
+    cmeta["spring_path"] = str(spring_path)
+    cmeta["spring_status"] = "generated"
+    save_state(meta)
+
+    return spring_path
+
+
+def generate_tests(
+    file_name: str,
+    class_name: str,
+    repo: Path = DEFAULT_LEGACY_REPO,
+):
+    """
+    Generate JUnit tests for a given class, using the previously-generated
+    Spring Boot code and the class-level documentation.
+    """
+    from .doc_generator import DOCS_DIR  # local import to avoid circulars
+
+    doc_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    if not doc_path.exists():
+        raise RuntimeError("Documentation not found; generate docs first.")
+
+    file_doc = json.loads(doc_path.read_text(encoding="utf-8"))
+    clazz = next(c for c in file_doc["classes"] if c["name"] == class_name)
+
+    meta = load_state()
+    cmeta = meta[file_name]["classes"][class_name]
+    spring_path = Path(cmeta["spring_path"])
+
+    test_path = generate_tests_for_spring_class(spring_path, clazz)
+
+    cmeta["test_path"] = str(test_path)
+    cmeta["test_status"] = "generated"
+    save_state(meta)
+
+    return test_path
