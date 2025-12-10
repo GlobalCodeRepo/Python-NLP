@@ -736,5 +736,265 @@ if st.button("Generate Target Code", key=f"code_{idx}"):
         st.error(f"Code generation failed: {e}")
 
 
+=============≈=================================≈=======================/
+
+# backend/blueprint_converter.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, List
+
+from .config import GENERATED_SRC_DIR
+from .llm_client import chat_json
 
 
+# ---------- SYSTEM PROMPT (STRICT) ----------
+
+def _spring_system_prompt() -> str:
+    """
+    Very strict system prompt for Spring Boot conversion.
+
+    We assume the model is strong (GPT-4.x / o3-mini) and can handle long,
+    highly constrained instructions.
+    """
+    return (
+        "You are a senior Spring Boot architect migrating a large legacy Java "
+        "cheque-processing application to a modern, layered Spring Boot project.\n"
+        "\n"
+        "You are given a JSON payload with:\n"
+        "  - base_package: the root Java package (e.g. com.bank.cheque).\n"
+        "  - blueprint: overview of ALL classes in this legacy module, including\n"
+        "               their responsibilities and relationships.\n"
+        "  - target_class: documentation for ONE specific class that you must\n"
+        "                  implement in Spring Boot.\n"
+        "  - layer_hint: suggested application layer for target_class:\n"
+        "       controller | service | repository | model | config | util.\n"
+        "\n"
+        "GENERAL RULES (MANDATORY):\n"
+        "  1) You MUST generate a COMPLETE, COMPILABLE Java class for target_class.\n"
+        "     - No method body may be empty.\n"
+        "     - Do NOT return null just to satisfy types; implement realistic logic\n"
+        "       or clear, step-by-step TODO comments that preserve all behaviour.\n"
+        "  2) You MUST implement EVERY documented method for this class.\n"
+        "     - All method names, parameters, and return types from the doc must\n"
+        "       appear in the generated class.\n"
+        "     - If the documentation describes validations, error handling, loops,\n"
+        "       conditions, or business rules, implement them explicitly.\n"
+        "  3) You MUST preserve cross-class behaviour.\n"
+        "     - If the documentation says this class calls/depends on another\n"
+        "       class, expose that as a Spring dependency:\n"
+        "         - @Service classes injected into controllers/services.\n"
+        "         - @Repository interfaces for persistence.\n"
+        "         - @Component/@Service utilities where appropriate.\n"
+        "  4) Use a LAYERED ARCHITECTURE:\n"
+        "     - controllers: @RestController, @RequestMapping, public REST API,\n"
+        "       convert input DTOs to domain types, delegate business logic to\n"
+        "       services only.\n"
+        "     - services: @Service, @Transactional as needed, encapsulate business\n"
+        "       rules, call repositories and other services.\n"
+        "     - repositories: @Repository / Spring Data JPA interfaces.\n"
+        "     - model: @Entity, @Embeddable, DTOs, domain objects.\n"
+        "     - config: @Configuration, @Bean definitions, property wiring.\n"
+        "     - util: @Component or plain utility classes with reusable logic.\n"
+        "  5) The code MUST be consistent with the blueprint:\n"
+        "     - Use class names, roles, and relationships from the blueprint to\n"
+        "       decide which collaborators to inject and how to call them.\n"
+        "     - Do not invent random new classes; if you create helper DTOs or\n"
+        "       enums, keep them simple and obviously related to the described\n"
+        "       behaviour.\n"
+        "  6) Package & imports:\n"
+        "     - Always start with a correct package declaration derived from\n"
+        "       base_package + logical layer folder.\n"
+        "     - Import only what you use.\n"
+        "     - Use modern Java 11 features where natural, but avoid exotic APIs.\n"
+        "  7) Code style:\n"
+        "     - Use clear naming.\n"
+        "     - Add brief Javadoc for public methods summarising business\n"
+        "       behaviour, especially where legacy design was complex.\n"
+        "     - Prefer constructor injection (@RequiredArgsConstructor) over field\n"
+        "       injection where possible.\n"
+        "\n"
+        "LAYER-SPECIFIC EXPECTATIONS:\n"
+        "  - If layer_hint/controller:\n"
+        "      * Use @RestController and @RequestMapping at class level.\n"
+        "      * Expose endpoints covering ALL documented operations.\n"
+        "      * Map method parameters to @RequestBody, @PathVariable, etc. as\n"
+        "        appropriate.\n"
+        "  - If layer_hint/service:\n"
+        "      * Use @Service.\n"
+        "      * Implement orchestration logic exactly as described in the docs,\n"
+        "        calling other services/repositories.\n"
+        "  - If layer_hint/repository:\n"
+        "      * Use Spring Data JPA interface style where possible.\n"
+        "      * Provide query methods that match documented lookups.\n"
+        "  - If layer_hint/model:\n"
+        "      * Use @Entity/@Table if the doc implies persistence.\n"
+        "      * Model all fields, enums, and relationships from the docs.\n"
+        "  - If layer_hint/config:\n"
+        "      * Use @Configuration, expose Beans required by other classes.\n"
+        "  - If layer_hint/util:\n"
+        "      * Implement pure helper logic used by multiple classes.\n"
+        "\n"
+        "OUTPUT FORMAT (STRICT):\n"
+        "  - You must output VALID JSON ONLY, no extra commentary.\n"
+        "  - The JSON must have EXACTLY the following keys:\n"
+        "        {\n"
+        "          \"file_name\": \"<JavaFileName>.java\",   // may be omitted, then use <ClassName>.java\n"
+        "          \"layer\": \"controller|service|repository|model|config|util\", // you may refine layer_hint\n"
+        "          \"code\": \"<full Java source>\"         // with newlines escaped\n"
+        "        }\n"
+        "  - Do NOT wrap JSON in markdown fences.\n"
+    )
+
+
+# ---------- HELPER: LAYER GUESS ----------
+
+def _guess_layer(class_name: str) -> str:
+    name = class_name.lower()
+    if any(k in name for k in ["controller", "menu", "resource", "endpoint"]):
+        return "controller"
+    if any(k in name for k in ["service", "manager", "processor", "handler"]):
+        return "service"
+    if any(k in name for k in ["repository", "repo", "dao"]):
+        return "repository"
+    if any(k in name for k in ["config", "configuration", "properties"]):
+        return "config"
+    if any(k in name for k in ["util", "utils", "helper"]):
+        return "util"
+    # default to model/domain if nothing matches
+    return "model"
+
+
+# ---------- BLUEPRINT CONVERTER ----------
+
+@dataclass
+class BlueprintSpringBootConverter:
+    """
+    Uses per-file documentation JSON to generate Spring Boot classes on a
+    per-class basis, guided by a module-level blueprint.
+    """
+    file_doc: Dict[str, Any]
+    base_package: str = "com.bank.cheque"
+
+    # ---- blueprint building ----
+
+    def _build_blueprint(self) -> Dict[str, Any]:
+        """
+        Build a compact blueprint summarising all classes in this file,
+        for the LLM to understand cross-class relationships.
+        """
+        classes: List[Dict[str, Any]] = []
+        for c in self.file_doc.get("classes", []):
+            classes.append(
+                {
+                    "name": c.get("name"),
+                    "description": c.get("description", ""),
+                    "role": c.get("role"),  # optional high-level role if present
+                    "methods": [
+                        {
+                            "name": m.get("name"),
+                            "description": m.get("description", ""),
+                            "returns": m.get("returns"),
+                            "parameters": [
+                                {
+                                    "name": p.get("name"),
+                                    "type": p.get("type"),
+                                    "description": p.get("description", ""),
+                                }
+                                for p in m.get("parameters", [])
+                            ],
+                        }
+                        for m in c.get("methods", [])
+                    ],
+                    "fields": [
+                        {
+                            "name": f.get("name"),
+                            "type": f.get("type"),
+                            "description": f.get("description", ""),
+                        }
+                        for f in c.get("fields", [])
+                    ],
+                    "relationships": c.get("relationships", []),
+                    "depends_on": c.get("depends_on", []),
+                    "inner_classes": [
+                        ic.get("name") for ic in c.get("inner_classes", [])
+                    ],
+                }
+            )
+        return {
+            "module_name": self.file_doc.get("module_name"),
+            "module_description": self.file_doc.get("description", ""),
+            "base_package": self.base_package,
+            "classes": classes,
+        }
+
+    def _find_class_doc(self, class_name: str) -> Dict[str, Any]:
+        for c in self.file_doc.get("classes", []):
+            if c.get("name") == class_name:
+                return c
+        raise ValueError(f"Class {class_name!r} not found in file documentation.")
+
+    # ---- main generation API ----
+
+    def generate_for_class(self, class_name: str) -> Path:
+        """
+        Generate a single Spring Boot class for the given class name.
+
+        Writes the .java file under GENERATED_SRC_DIR and returns the path.
+        """
+        class_doc = self._find_class_doc(class_name)
+        layer_hint = _guess_layer(class_name)
+        blueprint = self._build_blueprint()
+
+        payload = {
+            "base_package": self.base_package,
+            "blueprint": blueprint,
+            "target_class": class_doc,
+            "layer_hint": layer_hint,
+        }
+
+        resp = chat_json(_spring_system_prompt(), payload, max_tokens=3500)
+
+        code: str = resp["code"]
+        layer: str = resp.get("layer") or layer_hint
+        file_name: str = resp.get("file_name") or f"{class_name}.java"
+
+        # Normalise layer into a subfolder
+        layer_folder = {
+            "controller": "controller",
+            "service": "service",
+            "repository": "repository",
+            "model": "model",
+            "config": "config",
+            "util": "util",
+        }.get(layer.lower(), "service")
+
+        rel_dir = Path(*self.base_package.split(".")) / layer_folder
+        out_dir = GENERATED_SRC_DIR / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = out_dir / file_name
+        out_path.write_text(code, encoding="utf-8")
+        return out_path
+
+
+# ---------- OPTIONAL: generate all classes for a file ----------
+
+def convert_file_to_spring(
+    file_doc: Dict[str, Any],
+    base_package: str = "com.bank.cheque",
+) -> Dict[str, Path]:
+    """
+    Convenience helper if you ever want to generate ALL classes for a file
+    in one shot. Not used directly by app.py but you can call it from
+    experiments or batch scripts.
+    """
+    conv = BlueprintSpringBootConverter(file_doc, base_package=base_package)
+    result: Dict[str, Path] = {}
+    for c in file_doc.get("classes", []):
+        name = c.get("name")
+        if not name:
+            continue
+        result[name] = conv.generate_for_class(name)
+    return result
