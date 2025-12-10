@@ -279,3 +279,462 @@ def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 4000) -> 
             "message": "Fallback used because JSON decoding failed.",
         },
     }
+=======================================================================================÷
+
+def _doc_system_prompt() -> str:
+    """
+    System prompt for documentation generation.
+
+    We want a STRICT, EXHAUSTIVE, CLASS-CENTRIC description that can later be
+    used to generate a full Spring Boot application. The model MUST NOT skip
+    classes, methods, parameters or important control flows.
+    """
+    return """
+You are an expert software engineer and technical writer.
+
+You are given:
+- A CHUNK of legacy Java source code.
+- Metadata from the AST (file path, class / method ranges, etc.).
+
+Your task is to produce STRICT, MACHINE-READABLE documentation for this chunk.
+
+### General requirements
+
+1. Do NOT skip content.
+   - If a class, inner class, enum, interface, method or field appears in the chunk,
+     it MUST appear in the documentation.
+   - If a method body is partly outside the chunk due to truncation, still document
+     what is visible and mark it as "possibly_partial": true.
+
+2. Be CONSISTENT across chunks.
+   - Use the same class_name, method_name, field_name each time.
+   - Do NOT invent or rename classes or methods.
+
+3. Capture RELATIONSHIPS.
+   - For each class, list:
+     - other classes it uses (calls, instantiates, or depends on),
+     - other classes that use it (if obvious from the chunk),
+     - external systems (files, DB, network, console, etc.).
+
+4. No prose outside JSON.
+   - Output MUST be a single JSON object.
+   - No markdown, no backticks, no commentary.
+   - If something is unclear, represent the uncertainty inside fields such as
+     "notes" or "possibly_partial": true.
+
+### Output JSON shape
+
+You MUST return a JSON object with this shape (all keys required):
+
+{
+  "chunk_id": "<string – we will fill in>",
+  "classes": [
+    {
+      "name": "<class or inner-class name>",
+      "kind": "class | interface | enum",
+      "package": "<package or 'default'>",
+      "is_inner": true | false,
+      "outer_class": "<name of outer class or null>",
+      "description": "<short high-level description>",
+      "fields": [
+        {
+          "name": "<field name>",
+          "type": "<type as in code>",
+          "description": "<what this field represents>",
+          "is_static": true | false,
+          "is_final": true | false
+        }
+      ],
+      "methods": [
+        {
+          "name": "<method name>",
+          "description": "<purpose of the method>",
+          "return_type": "<type>",
+          "parameters": [
+            {
+              "name": "<parameter name>",
+              "type": "<type>",
+              "description": "<purpose>"
+            }
+          ],
+          "throws": ["<exception types>"],
+          "side_effects": [
+            "reads input", "writes to console", "writes to file", "DB access",
+            "calls external service", "none", ...
+          ],
+          "important_flows": [
+            "<short bullet-style descriptions of key branches or loops>"
+          ],
+          "possibly_partial": true | false
+        }
+      ],
+      "uses_classes": ["<names of classes it calls or depends on>"],
+      "used_by_hint": ["<names of classes that appear to use this class>"],
+      "notes": "<any extra technical notes, limitations, TODOs>"
+    }
+  ]
+}
+"""
+
+================================================================================
+# backend/blueprint_converter.py
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+from openai import AzureOpenAI
+
+from .llm_client import chat_json  # robust JSON helper
+
+
+class BlueprintSpringBootConverter:
+    """
+    Uses the collated documentation for a legacy file to:
+      1. Build a Spring Boot architecture blueprint.
+      2. Generate multiple Spring Boot classes (controller, service, repository,
+         model, util, config) that follow that blueprint.
+    """
+
+    def __init__(self, output_root: Path = Path("backend/generated")) -> None:
+        self.output_root = output_root
+        self.chat_client = AzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        )
+        self.chat_model = os.getenv("AZURE_DEPLOYMENT_CHAT")
+
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
+
+    def convert_file(
+        self,
+        file_doc: Dict[str, Any],
+        original_file_name: str,
+        domain_name: str = "ChequeProcessing",
+    ) -> Tuple[Dict[str, Any], List[Path]]:
+        """
+        High-level wrapper:
+          - builds blueprint
+          - generates Java classes for all modules
+          - returns the blueprint and list of generated files.
+        """
+        blueprint = self._build_blueprint(file_doc, original_file_name, domain_name)
+        java_files = self._generate_java_classes(file_doc, blueprint)
+        return blueprint, java_files
+
+    # ------------------------------------------------------------------
+    # STEP 1: ARCHITECTURE BLUEPRINT
+    # ------------------------------------------------------------------
+
+    def _build_blueprint(
+        self,
+        file_doc: Dict[str, Any],
+        original_file_name: str,
+        domain_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Ask the LLM to design a Spring Boot architecture that covers ALL
+        documented classes, not just a subset.
+        """
+        system_prompt = """
+You are an expert solution architect specializing in Spring Boot modernization
+of large monolithic Java applications for financial services.
+
+You will be given machine-generated documentation for a legacy Java file.
+The documentation contains classes, methods, relationships and side-effects.
+
+Your task in THIS STEP is ONLY to design a HIGH-LEVEL SPRING BOOT ARCHITECTURE
+BLUEPRINT. Do NOT generate Java code here.
+
+The blueprint MUST:
+
+- Cover ALL documented classes that represent meaningful behavior or data.
+- Explicitly map each legacy class into one or more Spring Boot components
+  (controller, service, repository, model, util, config).
+- Preserve important flows like:
+    - user login / authentication
+    - cheque creation, validation, printing, batch processing
+    - currency exchange
+    - reporting (history, status, exception report)
+
+Return STRICT JSON with this shape:
+
+{
+  "root_package": "com.bank.cheque",
+  "modules": {
+    "controller": [
+      {
+        "name": "<ControllerClassName>",
+        "source_classes": ["CreateApplication", "UserService", "..."],
+        "responsibilities": ["..."],
+        "exposes_endpoints_for": ["login", "processCheque", "generateReport"]
+      }
+    ],
+    "service": [
+      {
+        "name": "<ServiceClassName>",
+        "source_classes": ["UserService", "ChequeProcessor", "..."],
+        "depends_on": ["UserRepository", "ChequeRepository"],
+        "key_operations": ["login", "validateCheque", "..."]
+      }
+    ],
+    "repository": [
+      {
+        "name": "<RepositoryClassName>",
+        "source_classes": ["User", "Cheque", "..."],
+        "entity": "<EntityName>",
+        "persistence_type": "in_memory | jdbc | jpa | file | other"
+      }
+    ],
+    "model": [
+      {
+        "name": "<EntityOrDTOName>",
+        "source_classes": ["User", "Cheque", "CurrencyRate", "..."],
+        "fields": ["field1", "field2", "..."],
+        "used_by_services": ["UserService", "ChequeService"]
+      }
+    ],
+    "util": [
+      {
+        "name": "<UtilityClassName>",
+        "source_classes": ["Logger", "EmailNotificationService", "..."],
+        "purpose": "<short description>"
+      }
+    ],
+    "config": [
+      {
+        "name": "<ConfigClassName>",
+        "purpose": "<short description>"
+      }
+    ]
+  },
+  "cross_cutting_concerns": [
+    "logging", "exception handling", "input validation", ...
+  ],
+  "critical_flows": [
+    {
+      "name": "Cheque processing",
+      "from": "ControllerClass.method",
+      "through": ["ServiceClass.method", "RepositoryClass.method"],
+      "notes": "..."
+    }
+  ]
+}
+
+Rules:
+- DO NOT invent random features. Stay faithful to the documentation.
+- Use source_classes to indicate which legacy classes feed each Spring component.
+- Try to include ALL important legacy classes somewhere in the modules.
+"""
+
+        payload = {
+            "file_name": original_file_name,
+            "domain_name": domain_name,
+            "classes": file_doc.get("classes", []),
+        }
+
+        blueprint = chat_json(system_prompt, payload, max_tokens=3000)
+        return blueprint
+
+    # ------------------------------------------------------------------
+    # STEP 2: PER-MODULE JAVA CLASS GENERATION
+    # ------------------------------------------------------------------
+
+    def _generate_java_classes(
+        self, file_doc: Dict[str, Any], blueprint: Dict[str, Any]
+    ) -> List[Path]:
+        root_package = blueprint.get("root_package", "com.bank.legacyconv")
+        modules = blueprint.get("modules", {})
+
+        generated: List[Path] = []
+
+        for role in ["model", "repository", "service", "controller", "util", "config"]:
+            for entry in modules.get(role, []):
+                java_text = self._generate_one_class(root_package, role, entry, file_doc)
+                java_path = self._write_java_file(root_package, role, entry["name"], java_text)
+                generated.append(java_path)
+
+        return generated
+
+    def _write_java_file(
+        self, root_package: str, role: str, class_name: str, java_text: str
+    ) -> Path:
+        package_path = f"{root_package}.{role}".replace(".", "/")
+        java_dir = self.output_root / "src" / "main" / "java" / package_path
+        java_dir.mkdir(parents=True, exist_ok=True)
+        java_path = java_dir / f"{class_name}.java"
+        java_path.write_text(java_text, encoding="utf-8")
+        return java_path
+
+    # ------------------------------------------------------------------
+    # Single-class generation
+    # ------------------------------------------------------------------
+
+    def _generate_one_class(
+        self,
+        root_package: str,
+        role: str,
+        blueprint_entry: Dict[str, Any],
+        file_doc: Dict[str, Any],
+    ) -> str:
+        """
+        Ask the LLM to generate one Spring Boot class for the given role
+        using the subset of documentation relevant to this component.
+        """
+        class_name = blueprint_entry["name"]
+        source_classes = blueprint_entry.get("source_classes", [])
+
+        relevant_docs = self._collect_relevant_docs(file_doc, source_classes)
+
+        system_prompt = """
+You are a senior Spring Boot engineer.
+
+You will generate ONE Java class that is part of a larger Spring Boot
+application for cheque processing.
+
+You are given:
+- root_package: root package name for the application
+- role: one of "controller", "service", "repository", "model", "util", "config"
+- target: blueprint entry for this class
+- source_docs: documentation for the legacy classes that this component should
+  implement or adapt.
+
+You MUST:
+
+1. Generate EXACTLY ONE public Java class with the name given in target.name.
+2. Place it in the package: root_package + "." + role.
+3. Use appropriate Spring annotations:
+   - controller  -> @RestController (and optionally @RequestMapping)
+   - service     -> @Service
+   - repository  -> @Repository (or simple in-memory repository)
+   - model       -> plain POJO with fields, getters/setters, equals/hashCode/toString
+   - util        -> @Component or simple utility class
+   - config      -> @Configuration (if appropriate)
+4. Implement as much real logic as possible based on source_docs:
+   - preserve method names and parameters where they map cleanly.
+   - implement main flows such as login, cheque validation, batch processing,
+     currency exchange, report generation, etc.
+   - if full implementation would be too large or unclear, add TODO comments
+     but still implement the skeleton with key steps and data transformations.
+5. For repositories, use in-memory collections (e.g. Map<String, User>) for this POC.
+6. Handle errors and log important steps with System.out.println (or a simple logger).
+7. Output ONLY raw Java code. No markdown, no backticks, no prose.
+
+Code must be compilable with Java 11 and typical Spring Boot dependencies.
+"""
+
+        payload = {
+            "root_package": root_package,
+            "role": role,
+            "target": blueprint_entry,
+            "source_docs": relevant_docs,
+        }
+
+        resp = self.chat_client.chat.completions.create(
+            model=self.chat_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=0.2,
+            max_tokens=3500,
+        )
+
+        java_code = resp.choices[0].message.content or ""
+        return java_code
+
+    # ------------------------------------------------------------------
+    # Helper: select relevant documentation for a blueprint entry
+    # ------------------------------------------------------------------
+
+    def _collect_relevant_docs(
+        self,
+        file_doc: Dict[str, Any],
+        source_classes: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter the full documentation to only classes related to this component.
+        Uses source_classes as the primary signal, but also pulls in classes
+        they depend on (uses_classes).
+        """
+        all_classes = file_doc.get("classes", [])
+        by_name = {c.get("name"): c for c in all_classes}
+
+        result: Dict[str, Dict[str, Any]] = {}
+
+        # start with explicit source_classes
+        for name in source_classes:
+            if name in by_name:
+                result[name] = by_name[name]
+
+        # include directly used classes
+        to_expand = list(result.values())
+        for c in to_expand:
+            for used in c.get("uses_classes", []):
+                if used in by_name and used not in result:
+                    result[used] = by_name[used]
+
+        return list(result.values())
+
+===================================================================================================
+
+from pathlib import Path
+from typing import Dict, Any
+
+from .blueprint_converter import BlueprintSpringBootConverter
+from .doc_generator import load_file_doc  # or your existing helper
+from .config import DOCS_DIR
+
+def convert_file_to_spring(file_name: str) -> Dict[str, Any]:
+    """
+    Used by the UI when user clicks 'Generate Target Code' for a given
+    legacy Java file. Assumes documentation JSON already exists.
+    """
+    doc_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    if not doc_path.exists():
+        raise FileNotFoundError(f"Documentation not found: {doc_path}")
+
+    file_doc = load_file_doc(doc_path)
+    converter = BlueprintSpringBootConverter()
+    blueprint, java_files = converter.convert_file(
+        file_doc=file_doc,
+        original_file_name=file_name,
+        domain_name="ChequeProcessing",
+    )
+
+    # you can also persist blueprint if you want
+    bp_dir = DOCS_DIR / "blueprints"
+    bp_dir.mkdir(parents=True, exist_ok=True)
+    (bp_dir / f"{Path(file_name).stem}_blueprint.json").write_text(
+        json.dumps(blueprint, indent=2), encoding="utf-8"
+    )
+
+    return {
+        "blueprint": blueprint,
+        "generated_files": [str(p) for p in java_files],
+    }
+
+
+========================================================================================4
+
+from backend.pipeline import convert_file_to_spring
+
+
+if st.button("Generate Target Code", key=f"code_{idx}"):
+    try:
+        result = convert_file_to_spring(file_name)
+        gen_files = result["generated_files"]
+        st.success(f"Generated {len(gen_files)} Spring Boot classes.")
+        for p in gen_files:
+            st.write(f"- {p}")
+    except Exception as e:
+        st.error(f"Code generation failed: {e}")
+
+
+
+
