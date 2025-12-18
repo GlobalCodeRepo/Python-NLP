@@ -1131,3 +1131,32 @@ def collect_full_source_for_class(class_name: str) -> str:
 
     related.sort(key=lambda c: c["start_line"])
     return "\n\n".join(c["source_code"] for c in related)
+
+
+====================================================≈================
+
+# --- merge fields ---
+existing_fields = {f.get("name") for f in master["fields"]}
+for f in c.get("fields", []):
+    if f.get("name") not in existing_fields:
+        master["fields"].append(f)
+
+# --- merge class dependencies ---
+for dep in c.get("uses_classes", []):
+    master["uses_classes"].add(dep)
+
+for ub in c.get("used_by_hint", []):
+    master["used_by_hint"].add(ub)
+
+notes = (c.get("notes") or "").strip()
+if notes and len(notes) > len(master.get("notes", "")):
+    master["notes"] = notes
+
+
+
+master.pop("_methods_index", None)
+
+# convert sets → lists for JSON
+master["uses_classes"] = sorted(master.get("uses_classes", []))
+master["used_by_hint"] = sorted(master.get("used_by_hint", []))
+
