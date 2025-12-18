@@ -1112,3 +1112,22 @@ def generate_tests(
     save_state(meta)
 
     return test_path
+
+
+==============
+
+def collect_full_source_for_class(class_name: str) -> str:
+    """
+    Reconstruct full legacy source for a class by merging
+    all chunks where this class appears.
+    """
+    from .chunker import load_chunk_db
+
+    chunks = load_chunk_db()
+    related = [
+        c for c in chunks
+        if class_name in c.get("classes", [])
+    ]
+
+    related.sort(key=lambda c: c["start_line"])
+    return "\n\n".join(c["source_code"] for c in related)
