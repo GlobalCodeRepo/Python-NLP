@@ -1,0 +1,360 @@
+# ============================================================
+# Legacy Java → Spring Boot Modernization (AST Node Traversal)
+# Token-safe (<= 4k), Azure OpenAI chat + local embeddings
+# Single-file Streamlit App (end-to-end)
+# ============================================================
+
+from __future__ import annotations
+import os, json, math, re
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+
+from sentence_transformers import SentenceTransformer
+from tree_sitter import Parser
+from tree_sitter_languages import get_language
+from openai import AzureOpenAI
+import tiktoken
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+JAVA_FILE = Path("MainApplication.java")
+WORK = Path("workspace")
+WORK.mkdir(exist_ok=True)
+
+BASE_PACKAGE = "com.bank.legacy"
+PROJECT_DIR = WORK / "generated-springboot"
+
+MAX_CHAT_TOKENS = 4000
+SAFE_SRC_TOKENS = 2600      # java source slice
+SAFE_CTX_TOKENS = 700       # context (child summaries)
+SAFE_PROMPT_TOKENS = 300    # prompts
+VALIDATION_THRESHOLD = 90   # %
+
+EMBED_MODEL = "all-MiniLM-L6-v2"
+CHILD_SUMMARY_MAX_CHARS = 1200
+
+# ----------------------------
+# INIT MODELS
+# ----------------------------
+embedder = SentenceTransformer(EMBED_MODEL)
+
+llm = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+)
+
+ENC = tiktoken.get_encoding("cl100k_base")
+
+def tokens(s: str) -> int:
+    return len(ENC.encode(s))
+
+# ----------------------------
+# AST NODE MODEL
+# ----------------------------
+@dataclass
+class ClassNode:
+    name: str
+    start: int
+    end: int
+    parent: Optional[str] = None
+    children: List[str] = field(default_factory=list)
+    methods: List[Dict[str, int]] = field(default_factory=list)
+    processed: bool = False
+    doc: Optional[str] = None
+    validation: Optional[Dict[str, Any]] = None
+
+# ----------------------------
+# AST EXTRACTION (tree-sitter)
+# ----------------------------
+def extract_class_tree(java_code: str) -> Dict[str, ClassNode]:
+    parser = Parser()
+    parser.set_language(get_language("java"))
+    tree = parser.parse(java_code.encode("utf-8"))
+    root = tree.root_node
+
+    nodes: Dict[str, ClassNode] = {}
+
+    def walk(node, parent_class=None):
+        if node.type == "class_declaration":
+            cname = None
+            for c in node.children:
+                if c.type == "identifier":
+                    cname = c.text.decode()
+            if cname:
+                nodes[cname] = ClassNode(
+                    name=cname,
+                    start=node.start_point[0],
+                    end=node.end_point[0],
+                    parent=parent_class,
+                )
+                if parent_class:
+                    nodes[parent_class].children.append(cname)
+                parent_class = cname
+        # methods
+        if parent_class and node.type == "method_declaration":
+            mname = None
+            for c in node.children:
+                if c.type == "identifier":
+                    mname = c.text.decode()
+            if mname:
+                nodes[parent_class].methods.append({
+                    "name": mname,
+                    "start": node.start_point[0],
+                    "end": node.end_point[0],
+                })
+        for c in node.children:
+            walk(c, parent_class)
+
+    walk(root)
+    return nodes
+
+# ----------------------------
+# BOTTOM-UP ORDER
+# ----------------------------
+def bottom_up(nodes: Dict[str, ClassNode]) -> List[ClassNode]:
+    visited, order = set(), []
+    def dfs(n):
+        if n in visited: return
+        visited.add(n)
+        for ch in nodes[n].children:
+            dfs(ch)
+        order.append(nodes[n])
+    for name in nodes:
+        if nodes[name].parent is None:
+            dfs(name)
+    return order
+
+# ----------------------------
+# SOURCE EXTRACTION (TOKEN SAFE)
+# ----------------------------
+def extract_source(lines: List[str], start: int, end: int) -> str:
+    return "\n".join(lines[start:end+1])
+
+def slice_by_methods(lines, node: ClassNode) -> List[str]:
+    # If class too big, slice by methods (never mid-method)
+    parts = []
+    if not node.methods:
+        parts.append(extract_source(lines, node.start, node.end))
+        return parts
+    for m in node.methods:
+        parts.append(extract_source(lines, m["start"], m["end"]))
+    return parts
+
+# ----------------------------
+# EMBEDDINGS (supporting)
+# ----------------------------
+def embed_texts(texts: List[str]) -> np.ndarray:
+    if not texts: return np.zeros((0, 384))
+    return embedder.encode(texts, normalize_embeddings=True)
+
+# ----------------------------
+# PROMPTS
+# ----------------------------
+DOC_SYSTEM = """You are producing AUTHORITATIVE technical documentation
+for ONE Java class or ONE Java method slice.
+Rules:
+- Cover every branch, loop, side-effect, and error path.
+- Step-by-step algorithmic description.
+- Do NOT re-document inner classes already summarized; reference them.
+- If logic is unclear, mark as UNKNOWN explicitly.
+Return readable Markdown (not JSON-only).
+"""
+
+VAL_SYSTEM = """Validate documentation against Java source.
+Score accuracy and completeness. List EXACT missing logic.
+Return STRICT JSON:
+{"accuracy":0-100,"completeness":0-100,"missing":[...],"reason":"..."}
+"""
+
+BLUEPRINT_SYSTEM = """From AST + canonical documentation,
+produce a Spring Boot blueprint mapping classes to layers.
+Return JSON with keys:
+controller, service, serviceImpl, repository, model, util, config
+"""
+
+SPRING_SYSTEM = """You are a senior Spring Boot engineer.
+Generate ONE FULL, RUNNABLE Spring Boot class with complete methods.
+No stubs. No TODOs. Use correct annotations and wiring.
+"""
+
+TEST_SYSTEM = """Generate JUnit tests for the given Spring Boot class.
+Cover happy paths and failure paths.
+"""
+
+# ----------------------------
+# LLM CALL
+# ----------------------------
+def chat(system: str, user: str, max_tokens=2000) -> str:
+    r = llm.chat.completions.create(
+        model=os.getenv("AZURE_DEPLOYMENT_CHAT"),
+        messages=[{"role":"system","content":system},
+                  {"role":"user","content":user}],
+        temperature=0.1,
+        max_tokens=max_tokens,
+    )
+    return r.choices[0].message.content
+
+# ----------------------------
+# DOCUMENT + VALIDATE (NODE)
+# ----------------------------
+def document_node(node: ClassNode, src_slices: List[str], child_summaries: Dict[str,str]) -> str:
+    ctx = "\n".join([f"{k}:\n{v[:CHILD_SUMMARY_MAX_CHARS]}" for k,v in child_summaries.items()])
+    docs = []
+    for sl in src_slices:
+        # ensure token safety
+        while tokens(sl) > SAFE_SRC_TOKENS:
+            sl = sl[:int(len(sl)*0.85)]
+        user = f"CLASS/METHOD SOURCE:\n{sl}\n\nINNER CLASS SUMMARIES:\n{ctx}"
+        docs.append(chat(DOC_SYSTEM, user, max_tokens=1200))
+    return "\n\n".join(docs)
+
+def validate_node(java_src: str, doc: str) -> Dict[str,Any]:
+    while tokens(java_src) > SAFE_SRC_TOKENS:
+        java_src = java_src[:int(len(java_src)*0.85)]
+    user = f"JAVA:\n{java_src}\n\nDOC:\n{doc}"
+    return json.loads(chat(VAL_SYSTEM, user, max_tokens=800))
+
+# ----------------------------
+# MAVEN PROJECT WRITERS
+# ----------------------------
+def write_pom(base: Path):
+    base.mkdir(parents=True, exist_ok=True)
+    (base/"pom.xml").write_text("""<project xmlns="http://maven.apache.org/POM/4.0.0"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+ http://maven.apache.org/xsd/maven-4.0.0.xsd">
+ <modelVersion>4.0.0</modelVersion>
+ <groupId>com.bank</groupId>
+ <artifactId>legacy-modernized</artifactId>
+ <version>0.0.1-SNAPSHOT</version>
+ <parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>3.2.5</version>
+ </parent>
+ <properties><java.version>17</java.version></properties>
+ <dependencies>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
+  <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>runtime</scope></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+ </dependencies>
+</project>""")
+
+def write_app(base: Path):
+    p = BASE_PACKAGE.replace(".","/")
+    d = base/f"src/main/java/{p}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d/"Application.java").write_text(f"""package {BASE_PACKAGE};
+import org.springframework.boot.*;
+import org.springframework.boot.autoconfigure.*;
+@SpringBootApplication
+public class Application {{
+ public static void main(String[] args) {{
+  SpringApplication.run(Application.class,args);
+ }}
+}}""")
+
+def write_yml(base: Path):
+    (base/"src/main/resources").mkdir(parents=True, exist_ok=True)
+    (base/"src/main/resources/application.yml").write_text(
+"""spring:
+ datasource:
+  url: jdbc:h2:mem:testdb
+ jpa:
+  hibernate:
+   ddl-auto: update
+ server:
+  port: 8080
+""")
+
+ROLE_PKG = {
+    "controller":"controller","service":"service","serviceImpl":"service",
+    "repository":"repository","model":"model","util":"util","config":"config"
+}
+
+def write_java(base: Path, role: str, cls: str, code: str, test=False):
+    sub = ROLE_PKG.get(role,"")
+    pkg = f"{BASE_PACKAGE}.{sub}" if sub else BASE_PACKAGE
+    p = pkg.replace(".","/")
+    root = "src/test/java" if test else "src/main/java"
+    d = base/f"{root}/{p}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d/f"{cls}{'Test' if test else ''}.java").write_text(code)
+
+# ----------------------------
+# STREAMLIT UI
+# ----------------------------
+st.set_page_config(layout="wide")
+st.title("AST Node–Based Legacy Java → Spring Boot (Token-Safe)")
+
+java = JAVA_FILE.read_text(encoding="utf-8")
+lines = java.splitlines()
+
+if "state" not in st.session_state:
+    st.session_state.state = {}
+
+# 1) AST
+if st.button("1️⃣ Extract AST"):
+    nodes = extract_class_tree(java)
+    st.session_state.state["nodes"] = nodes
+    st.json({k:{"start":v.start,"end":v.end,"parent":v.parent,"children":v.children} for k,v in nodes.items()})
+
+# 2) Document (bottom-up)
+if st.button("2️⃣ Generate Documentation (Bottom-Up)"):
+    nodes = st.session_state.state["nodes"]
+    order = bottom_up(nodes)
+    docs, metrics = {}, {}
+    for node in order:
+        if node.processed: continue
+        src = extract_source(lines, node.start, node.end)
+        slices = [src]
+        if tokens(src) > SAFE_SRC_TOKENS:
+            slices = slice_by_methods(lines, node)
+        child_docs = {c:nodes[c].doc for c in node.children if nodes[c].doc}
+        doc = document_node(node, slices, child_docs)
+        val = validate_node(src, doc)
+        node.doc, node.validation, node.processed = doc, val, True
+        docs[node.name] = doc
+        metrics[node.name] = val
+    st.session_state.state["docs"] = docs
+    st.session_state.state["metrics"] = metrics
+    st.success("Documentation generated & validated")
+
+# Validation charts
+if "metrics" in st.session_state.state:
+    acc = [v["accuracy"] for v in st.session_state.state["metrics"].values()]
+    comp = [v["completeness"] for v in st.session_state.state["metrics"].values()]
+    fig, ax = plt.subplots(1,2, figsize=(8,4))
+    ax[0].pie([np.mean(acc),100-np.mean(acc)], labels=["Accurate","Gap"], autopct="%1.1f%%")
+    ax[1].pie([np.mean(comp),100-np.mean(comp)], labels=["Complete","Gap"], autopct="%1.1f%%")
+    st.pyplot(fig)
+
+# 3) Blueprint
+if st.button("3️⃣ Generate Spring Boot Blueprint"):
+    all_docs = "\n\n".join(st.session_state.state["docs"].values())
+    bp = json.loads(chat(BLUEPRINT_SYSTEM, json.dumps(st.session_state.state["nodes"])+"\n"+all_docs, max_tokens=1200))
+    st.session_state.state["blueprint"] = bp
+    st.json(bp)
+
+# 4) Generate Maven Project
+if st.button("4️⃣ Generate Full Maven Project"):
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    write_pom(PROJECT_DIR); write_app(PROJECT_DIR); write_yml(PROJECT_DIR)
+    bp = st.session_state.state["blueprint"]
+    canon = "\n\n".join(st.session_state.state["docs"].values())
+    for role, classes in bp.items():
+        for cls in classes:
+            code = chat(SPRING_SYSTEM, f"ROLE:{role}\nCLASS:{cls}\nDOC:\n{canon}", max_tokens=1800)
+            write_java(PROJECT_DIR, role, cls, code, test=False)
+            test = chat(TEST_SYSTEM, code, max_tokens=1200)
+            write_java(PROJECT_DIR, role, cls, test, test=True)
+    st.success(f"Maven project generated at {PROJECT_DIR.resolve()}")
